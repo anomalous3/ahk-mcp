@@ -31,10 +31,11 @@ The savings compound fast. A 20-step workflow that would cost ~50k tokens in scr
 
 1. **Windows 10/11** (this is an AutoHotkey project — Windows is the point)
 2. **Python 3.10+**
-3. **AutoHotkey v2** — download from [autohotkey.com](https://www.autohotkey.com/). The installer puts it at:
+3. **AutoHotkey v2** — install via winget (the official distribution, avoids dodgy third-party repackages):
    ```
-   %LOCALAPPDATA%\Programs\AutoHotkey\v2\AutoHotkey64.exe
+   winget install AutoHotkey.AutoHotkey
    ```
+   This puts it at `%LOCALAPPDATA%\Programs\AutoHotkey\v2\AutoHotkey64.exe`. If you prefer a manual install, download only from [autohotkey.com](https://www.autohotkey.com/) — avoid other sources.
 
 ### Setup
 
