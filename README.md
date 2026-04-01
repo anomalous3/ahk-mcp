@@ -118,6 +118,45 @@ After adding the config, restart Claude Code. The tools will appear with the `mc
 |---|---|
 | `ahk_eval` | Execute arbitrary AHK v2 code. Output via `FileAppend "text", "*"`, end with `ExitApp`. Full AHK v2 language: COM automation, DllCall, regex, file I/O, window manipulation — anything. |
 
+## Browser automation via UI Automation
+
+Modern browsers (Firefox, Chrome, Edge) render everything through GPU surfaces — `WinGetText` returns nothing useful. The UIA tools solve this by reading the browser's accessibility tree, which is the same interface screen readers use.
+
+**Read page content** — every link, button, text element, and form field, with names and pixel coordinates:
+```
+> ahk_uia_find target="Firefox" control_type="Hyperlink"
+
+Found 16 element(s) in: anomalous3/hearth — Mozilla Firefox
+HyperlinkControl: "Issues" @4425,283,32x32 = https://github.com/issues
+HyperlinkControl: "Pull requests" @4465,283,32x32 = https://github.com/pulls
+...
+```
+
+**Get the current URL** without screenshots or clipboard tricks:
+```
+> ahk_uia_url
+
+Window: anomalous3/hearth — Mozilla Firefox
+URL: https://github.com/anomalous3/hearth
+```
+
+**Dump the full accessibility tree** to understand page structure:
+```
+> ahk_uia_tree target="Firefox" max_depth=5
+
+Window: anomalous3/hearth — Mozilla Firefox
+  ToolBarControl: "Navigation"
+    ComboBoxControl = https://github.com/anomalous3/hearth
+      EditControl: "Search with Google or enter address" = https://github.com/anomalous3/hearth
+  DocumentControl = https://github.com/anomalous3/hearth
+    HyperlinkControl: "Issues" = https://github.com/issues
+    ...
+```
+
+The UIA approach gives you element names, types, values, and bounding rectangles — everything you need to read and interact with browser content. Combine with `ahk_click` (using coordinates from UIA) or `ahk_send` (for keyboard navigation) to drive the browser without any browser-specific automation framework.
+
+**Use Firefox.** It exposes the richest accessibility tree of the major browsers — more element detail, better labeling, and more consistent structure than Chrome or Edge. The examples above are all from Firefox.
+
 ## The guardrails pattern
 
 Every action tool reports what happened:
