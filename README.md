@@ -8,10 +8,12 @@ The thesis is simple: the Windows accessibility tree already contains a machine-
 
 ## How it works
 
-ahk-mcp exposes 15 tools over MCP's stdio transport:
+ahk-mcp exposes 27 tools over MCP's stdio transport:
 
 - **Observation tools** read the accessibility tree, window text, and UI element properties
 - **Action tools** send keystrokes, click coordinates, manage clipboard, launch programs
+- **Background action tools** act on windows *without* taking focus or moving the cursor (see [Background input](#background-input))
+- **Browser tools** drive Edge/Chrome through the DevTools Protocol, fully in the background
 - **`ahk_eval`** is the escape hatch — execute arbitrary AHK v2 code for anything the built-in tools don't cover
 
 Every action tool reports context before and after execution (which window was focused, what changed). This "guardrails pattern" means the agent always knows what it just did and what state the system is in, without needing a follow-up screenshot.
@@ -55,6 +57,8 @@ uv venv .venv
 pip install -r requirements.txt
 ```
 
+Requires `mcp` 2.x (the server uses the 2.x constructor-based lowlevel API).
+
 ### Verify AHK is found
 
 The server looks for AutoHotkey at the default install path. If yours is elsewhere, set the `AHK_EXE` environment variable:
@@ -93,24 +97,48 @@ After adding the config, restart Claude Code. The tools will appear with the `mc
 | Tool | Description |
 |---|---|
 | `ahk_windows` | List all visible windows with title, class, PID, and position. The "what's on screen" overview. |
-| `ahk_window_info` | Detailed info on the active window: title, class, PID, process, position, and a list of all UI controls with their text. |
+| `ahk_window_info` | Detailed info on a window (`target=`, default active): title, class, PID, process, position, and its Win32 controls (ClassNN names) with their text. |
 | `ahk_read` | Read all text content from a window (active or by title). Cheap and fast. |
-| `ahk_uia_tree` | Dump the UI Automation accessibility tree. This is how you read browser content, form fields, and UI state that WinGetText can't see. Configurable depth and node limit. |
-| `ahk_uia_find` | Search for UI elements by name and/or control type. Returns matches with position and value. Find that "Submit" button without scanning the whole tree. |
+| `ahk_uia_tree` | Dump the UI Automation accessibility tree. In browsers it shows the active tab's page; unnamed layout wrappers are collapsed so depth goes to real content. |
+| `ahk_uia_find` | Search for UI elements by name and/or control type at any depth. Numbered matches with position and value. Token matching (all words, any order); polls briefly for pages still rendering. |
 | `ahk_uia_url` | Get the current URL from the active browser's address bar (Firefox, Chrome, Edge). |
 | `ahk_screenshot` | Capture a screenshot of a window, region, or full screen. Returns a PNG file path. Uses PrintWindow for per-window capture (works even when the window is occluded). The fallback when you genuinely need pixels. |
 
-### Action
+### Action (foreground)
+
+These use the real keyboard/cursor and need the target in front. Pass `target=` so the window is activated and verified **inside the same call**: tool calls are seconds apart, and the terminal running the agent reclaims focus in between, so a separate `ahk_focus` followed by `ahk_type` types into the terminal.
 
 | Tool | Description |
 |---|---|
-| `ahk_focus` | Activate/focus a window by title (partial match). |
+| `ahk_focus` | Activate/focus a window by title. |
 | `ahk_send` | Send keystrokes using AHK syntax: `{Enter}`, `^c` (Ctrl+C), `!{F4}` (Alt+F4), `+{Home}` (Shift+Home), etc. |
-| `ahk_type` | Type plain text via SendText (no special key interpretation). Use this for typing into fields. |
+| `ahk_type` | Type plain text via SendText (no special key interpretation). |
 | `ahk_click` | Click at screen coordinates. Reports which window was active before and after. |
 | `ahk_clipboard` | Get or set the system clipboard. |
 | `ahk_run` | Launch a program, open a file, or navigate to a URL. |
 | `ahk_msgbox` | Show a message box to the user (notifications, confirmations). |
+
+### Background action
+
+| Tool | Description |
+|---|---|
+| `ahk_uia_invoke` | Find an element and act through UI Automation (Invoke / Toggle / Select / Expand / default action). No coordinates; works occluded and scrolled out of view. Focus guarded. |
+| `ahk_uia_set_value` | Set an input's text through UI Automation. Fires real input/change events. Focus guarded. |
+| `ahk_control_send` | Text/keys to a background window via posted messages (AHK ControlSend). Classic Win32 only. |
+| `ahk_control_click` | Click a control or client point via posted messages (AHK ControlClick NA). Classic Win32 only. |
+
+### Browser (Edge/Chrome, via DevTools Protocol)
+
+| Tool | Description |
+|---|---|
+| `ahk_browser_launch` | Start the browser (your normal profile) with background-friendly flags; reports whether remote debugging is enabled. `restart=true` relaunches a running browser, restoring tabs. |
+| `ahk_browser_tabs` | List tabs as `[index] title \| url`; pass index or title/URL text as `tab=` elsewhere. |
+| `ahk_browser_find` | Search a tab's accessibility tree by name/role; matches carry a `#ref`. |
+| `ahk_browser_tree` | Dump a tab's accessibility tree with wrappers collapsed. |
+| `ahk_browser_click` | Click by `#ref`, name/role, or viewport x,y. Renderer-level events: no cursor, no focus change. |
+| `ahk_browser_type` | Focus (optional), clear (optional), insert text, press keys (`Enter`, `Ctrl+A`, `Shift+Tab`). Works on React-controlled inputs and contenteditable editors. |
+| `ahk_browser_navigate` | Load a URL in a tab or a new background tab; waits for load. |
+| `ahk_browser_eval` | Evaluate JavaScript in a tab and return the result. |
 
 ### Escape hatch
 
@@ -118,44 +146,54 @@ After adding the config, restart Claude Code. The tools will appear with the `mc
 |---|---|
 | `ahk_eval` | Execute arbitrary AHK v2 code. Output via `FileAppend "text", "*"`, end with `ExitApp`. Full AHK v2 language: COM automation, DllCall, regex, file I/O, window manipulation — anything. |
 
-## Browser automation via UI Automation
+## Background input
 
-Modern browsers (Firefox, Chrome, Edge) render everything through GPU surfaces — `WinGetText` returns nothing useful. The UIA tools solve this by reading the browser's accessibility tree, which is the same interface screen readers use.
+The goal: act on a window while the user (or the agent's own terminal) keeps focus. What Windows actually allows, measured on Windows 11 with a test page and a classic Win32 window, both covered by another window:
 
-**Read page content** — every link, button, text element, and form field, with names and pixel coordinates:
+| | Read tree / find | UIA actions (`ahk_uia_invoke`, `ahk_uia_set_value`) | Posted messages (`ahk_control_send`, `ahk_control_click`) | DevTools (`ahk_browser_*`) |
+|---|---|---|---|---|
+| Classic Win32 (dialogs, older apps) | ✅ | ✅ works, **raises the window** | ✅ **true background** | — |
+| Edge / Chrome | ✅ (launch flags) | ✅ works, **raises the window** | ❌ ignored | ✅ **true background** |
+| Firefox | ✅ (occlusion pref) | ✅ works, **raises the window** | ❌ ignored | — |
+| WinUI / UWP (Win11 Notepad, Settings) | ✅ | ? | ❌ ignored | — |
+
+- **UIA actions raise the target.** Apps bring their window forward when an action focuses an element, and UIA grants them the foreground right to do it (so `LockSetForegroundWindow` doesn't help). `ahk_uia_invoke` / `ahk_uia_set_value` run a **focus guard** that puts the previous foreground window straight back: a brief flash, and a short window in which keystrokes could land in the target. Pass `keep_focus=true` to skip it.
+- **Posted window messages** only reach classic Win32 controls. Modern UI frameworks read input from the raw input stack, not the message queue.
+- **Chromium via DevTools** is the one path to true background input in a browser: mouse and key events go straight to the renderer. Since most browsing happens in Chromium, that covers the common case.
+
+## Browser automation
+
+### Edge / Chrome (recommended): DevTools Protocol
+
+One-time setup:
+
+1. Start the browser through `ahk_browser_launch` (or `ahk_browser_launch restart=true` if it's already running). This adds `--force-renderer-accessibility --disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows`, which keep page content alive and readable while the window is covered — Chromium otherwise treats a fully occluded window as hidden and empties its accessibility tree.
+2. Open `edge://inspect/#remote-debugging` (`chrome://inspect/#remote-debugging`) and tick **Allow remote debugging for this browser instance**. It persists across restarts. This replaces `--remote-debugging-port`, which Chromium ignores for your normal profile since ~v136. **Don't pass `--remote-debugging-port` yourself**: it leaves the inspect-page server stuck on "starting…".
+3. On the first `ahk_browser_*` call in a server session the browser asks you to approve the connection. The prompt is inside the browser window, so the server brings the browser forward for it and restores focus afterwards. The connection is kept open, so that's once per session.
+
+The browser tools read Chromium's own accessibility tree (roles, names, values, states) and act on `#ref`s from it:
+
 ```
-> ahk_uia_find target="Firefox" control_type="Hyperlink"
+> ahk_browser_find name="focus races" role="link"
 
-Found 16 element(s) in: anomalous3/hearth — Mozilla Firefox
-HyperlinkControl: "Issues" @4425,283,32x32 = https://github.com/issues
-HyperlinkControl: "Pull requests" @4465,283,32x32 = https://github.com/pulls
+Tab: GitHub - anomalous3/macbot-mcp ...  | https://github.com/anomalous3/macbot-mcp
+Found 4 element(s) (#N = ref):
+[0] link: "Fix focus races, deepen ui_find, add mac_ui_press"  #2363
 ...
+
+> ahk_browser_type name="Controlled input" role="textbox" clear=true text="hello" keys="Enter"
 ```
 
-**Get the current URL** without screenshots or clipboard tricks:
-```
-> ahk_uia_url
+### Any browser: UI Automation
 
-Window: anomalous3/hearth — Mozilla Firefox
-URL: https://github.com/anomalous3/hearth
-```
+`ahk_uia_find` / `ahk_uia_tree` read any browser's accessibility tree through UIA, and `ahk_uia_invoke` / `ahk_uia_set_value` act on it (focus guarded). Two things that make this work on real pages:
 
-**Dump the full accessibility tree** to understand page structure:
-```
-> ahk_uia_tree target="Firefox" max_depth=5
+- **Depth.** Page content sits 10–35 levels below the window root (the first link on a GitHub repo page is at depth 16). Searches use native `FindAll` with no depth cap, and tree dumps collapse unnamed wrappers.
+- **Tabs.** Firefox exposes *every* open tab's document at once. Both tools default to `scope="page"`: the active tab's document. `scope="window"` searches everything, including browser chrome.
 
-Window: anomalous3/hearth — Mozilla Firefox
-  ToolBarControl: "Navigation"
-    ComboBoxControl = https://github.com/anomalous3/hearth
-      EditControl: "Search with Google or enter address" = https://github.com/anomalous3/hearth
-  DocumentControl = https://github.com/anomalous3/hearth
-    HyperlinkControl: "Issues" = https://github.com/issues
-    ...
-```
+**Firefox** needs `widget.windows.window_occlusion_tracking.enabled = false` in `about:config` to stay readable while covered; with it on, a fully covered Firefox window reports everything offscreen with no positions. **Edge/Chrome** need the launch flags above.
 
-The UIA approach gives you element names, types, values, and bounding rectangles — everything you need to read and interact with browser content. Combine with `ahk_click` (using coordinates from UIA) or `ahk_send` (for keyboard navigation) to drive the browser without any browser-specific automation framework.
-
-**Use Firefox.** It exposes the richest accessibility tree of the major browsers — more element detail, better labeling, and more consistent structure than Chrome or Edge. The examples above are all from Firefox.
+Window titles are matched case-insensitively, word order free, and ignoring the zero-width space Edge puts in "Microsoft​ Edge".
 
 ## The guardrails pattern
 
@@ -208,6 +246,7 @@ Environment variables:
 |---|---|---|
 | `AHK_EXE` | `%LOCALAPPDATA%\Programs\AutoHotkey\v2\AutoHotkey64.exe` | Path to AutoHotkey v2 executable |
 | `AHK_TIMEOUT` | `10` | Default script execution timeout in seconds |
+| `AHK_BROWSER` | `edge` | Default browser for `ahk_browser_*` (`edge` or `chrome`) |
 
 ## License
 

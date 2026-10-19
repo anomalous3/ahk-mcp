@@ -8,6 +8,7 @@ structured text results instead of images.
 Token cost per action: ~200-700 tokens (vs ~2000-3500 for screenshot-based).
 """
 
+import ctypes
 import json
 import os
 import subprocess
@@ -16,9 +17,12 @@ import tempfile
 import time
 from pathlib import Path
 
+import anyio
 import mcp.types as types
-from mcp.server.lowlevel.server import Server, NotificationOptions
+from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
+
+import cdp
 
 # --- Configuration ---
 
@@ -93,8 +97,22 @@ try {{
 ExitApp
 """
 
-SCRIPT_SEND = r"""
-#Requires AutoHotkey v2.0
+# Focus and the action must happen inside one script: tool calls are seconds
+# apart, and the terminal running the agent reclaims focus in between, so a
+# separate ahk_focus call followed by ahk_type sends keys to the terminal.
+ACTIVATE = r"""
+win := "{win}"
+if (win != "A") {{
+    try WinActivate win
+    if !WinWaitActive(win,, 2) {{
+        FileAppend "[Error] Could not activate target window (active is: " . WinGetTitle("A") . ")", "*"
+        ExitApp
+    }}
+    Sleep 100
+}}
+"""
+
+SCRIPT_SEND = "#Requires AutoHotkey v2.0\n" + ACTIVATE + r"""
 keys := "{keys}"
 try {{
     title := WinGetTitle("A")
@@ -107,8 +125,7 @@ try {{
 ExitApp
 """
 
-SCRIPT_SEND_TEXT = r"""
-#Requires AutoHotkey v2.0
+SCRIPT_SEND_TEXT = "#Requires AutoHotkey v2.0\n" + ACTIVATE + r"""
 text := "{text}"
 try {{
     title := WinGetTitle("A")
@@ -121,18 +138,52 @@ try {{
 ExitApp
 """
 
-SCRIPT_CLICK = r"""
-#Requires AutoHotkey v2.0
+SCRIPT_CLICK = "#Requires AutoHotkey v2.0\n" + ACTIVATE + r"""
 x := {x}
 y := {y}
 button := "{button}"
 try {{
-    ; Report what's under the cursor before clicking
     prev := WinGetTitle("A")
     Click x, y, button
     Sleep 50
     post := WinGetTitle("A")
     FileAppend "Before: " . prev . "`nClicked: " . x . "," . y . " " . button . "`nAfter: " . post, "*"
+}} catch as e {{
+    FileAppend "[Error] " . e.Message, "*"
+}}
+ExitApp
+"""
+
+# Background input via posted window messages. Never touches focus or the
+# cursor, but only classic Win32 controls act on these messages; browsers,
+# WinUI/UWP apps (Win11 Notepad, Settings) and most Electron apps ignore them.
+SCRIPT_CONTROL_SEND = r"""
+#Requires AutoHotkey v2.0
+win := "{win}"
+ctl := "{control}"
+keys := "{keys}"
+try {{
+    if (ctl = "")
+        {send_cmd} keys,, win
+    else
+        {send_cmd} keys, ctl, win
+    FileAppend "Target: " . WinGetTitle(win) . (ctl = "" ? "" : " / " . ctl) . "`nSent ({mode}): " . StrLen(keys) . " chars (background, focus unchanged: " . WinGetTitle("A") . ")", "*"
+}} catch as e {{
+    FileAppend "[Error] " . e.Message, "*"
+}}
+ExitApp
+"""
+
+SCRIPT_CONTROL_CLICK = r"""
+#Requires AutoHotkey v2.0
+win := "{win}"
+ctl := "{control}"
+try {{
+    if (ctl != "")
+        ControlClick ctl, win,, "{button}", {count}, "NA"
+    else
+        ControlClick "x{x} y{y}", win,, "{button}", {count}, "NA"
+    FileAppend "Target: " . WinGetTitle(win) . "`nClicked: " . (ctl != "" ? ctl : "client {x},{y}") . " {button} x{count} (background, focus unchanged: " . WinGetTitle("A") . ")", "*"
 }} catch as e {{
     FileAppend "[Error] " . e.Message, "*"
 }}
@@ -202,12 +253,13 @@ ExitApp
 
 SCRIPT_WINDOW_INFO = r"""
 #Requires AutoHotkey v2.0
+win := "{win}"
 try {{
-    title := WinGetTitle("A")
-    cls := WinGetClass("A")
-    pid := WinGetPID("A")
-    exe := WinGetProcessName("A")
-    WinGetPos(&x, &y, &w, &h, "A")
+    title := WinGetTitle(win)
+    cls := WinGetClass(win)
+    pid := WinGetPID(win)
+    exe := WinGetProcessName(win)
+    WinGetPos(&x, &y, &w, &h, win)
     out := "Title: " . title
     out .= "`nClass: " . cls
     out .= "`nPID: " . pid
@@ -216,13 +268,13 @@ try {{
 
     ; List controls
     try {{
-        controls := WinGetControls("A")
+        controls := WinGetControls(win)
         out .= "`n`nControls (" . controls.Length . "):"
         limit := Min(controls.Length, 50)
         loop limit {{
             ctl := controls[A_Index]
             try {{
-                ctlText := ControlGetText(ctl, "A")
+                ctlText := ControlGetText(ctl, win)
                 if (StrLen(ctlText) > 80)
                     ctlText := SubStr(ctlText, 1, 80) . "..."
                 out .= "`n  " . ctl . ": " . ctlText
@@ -342,141 +394,261 @@ def escape_ahk(s: str) -> str:
 
 
 # --- UI Automation (Python-native) ---
+#
+# Browser page content sits 10-35 levels below the window root, and Firefox
+# exposes every open tab's document at once (background tabs are offscreen
+# with an empty rect). So searches use native FindAll calls with no depth cap,
+# scoped by default to the active tab's document, and tree dumps collapse the
+# unnamed wrapper nodes that make up most of that depth.
 
-def _uia_control_type_name(type_id: int) -> str:
-    """Map UIA ControlTypeId to readable name."""
-    names = {
-        50000: "Button", 50001: "Calendar", 50002: "CheckBox",
-        50003: "ComboBox", 50004: "Edit", 50005: "Hyperlink",
-        50006: "Image", 50007: "ListItem", 50008: "List",
-        50009: "Menu", 50010: "MenuBar", 50011: "MenuItem",
-        50012: "ProgressBar", 50013: "RadioButton", 50014: "ScrollBar",
-        50015: "Slider", 50016: "Spinner", 50017: "StatusBar",
-        50018: "Tab", 50019: "TabItem", 50020: "Text",
-        50021: "ToolBar", 50022: "ToolTip", 50023: "Tree",
-        50024: "TreeItem", 50025: "Custom", 50026: "Group",
-        50027: "Thumb", 50028: "DataGrid", 50029: "DataItem",
-        50030: "Document", 50031: "SplitButton", 50032: "Window",
-        50033: "Pane", 50034: "Header", 50035: "HeaderItem",
-        50036: "Table", 50037: "TitleBar", 50038: "Separator",
-    }
-    return names.get(type_id, f"Unknown({type_id})")
+CONTROL_TYPE_NAMES = {
+    50000: "Button", 50001: "Calendar", 50002: "CheckBox",
+    50003: "ComboBox", 50004: "Edit", 50005: "Hyperlink",
+    50006: "Image", 50007: "ListItem", 50008: "List",
+    50009: "Menu", 50010: "MenuBar", 50011: "MenuItem",
+    50012: "ProgressBar", 50013: "RadioButton", 50014: "ScrollBar",
+    50015: "Slider", 50016: "Spinner", 50017: "StatusBar",
+    50018: "Tab", 50019: "TabItem", 50020: "Text",
+    50021: "ToolBar", 50022: "ToolTip", 50023: "Tree",
+    50024: "TreeItem", 50025: "Custom", 50026: "Group",
+    50027: "Thumb", 50028: "DataGrid", 50029: "DataItem",
+    50030: "Document", 50031: "SplitButton", 50032: "Window",
+    50033: "Pane", 50034: "Header", 50035: "HeaderItem",
+    50036: "Table", 50037: "TitleBar", 50038: "Separator",
+    50039: "SemanticZoom", 50040: "AppBar",
+}
+DOCUMENT_TYPE = 50030
+# Shown in tree dumps even when unnamed: things an agent can act on.
+INTERACTIVE_TYPES = {50000, 50002, 50003, 50004, 50005, 50007, 50011, 50013,
+                     50015, 50016, 50019, 50024, 50031}
+# Wrapper types that are dropped from tree dumps when unnamed.
+WRAPPER_TYPES = {50006, 50020, 50021, 50025, 50026, 50033}
+
+UIA_NAME = 30005
+UIA_CONTROL_TYPE = 30003
+UIA_RECT = 30001
+UIA_OFFSCREEN = 30022
+UIA_VALUE = 30045
+TREE_SCOPE_DESCENDANTS = 4
+TREE_SCOPE_SUBTREE = 7
 
 
-def uia_tree(target: str = "", max_depth: int = 4, max_nodes: int = 200) -> str:
-    """Dump the UI Automation tree for a window."""
+def _ia():
+    from uiautomation.uiautomation import _AutomationClient
+    return _AutomationClient.instance().IUIAutomation
+
+
+def _cache_request(subtree: bool = False):
+    cr = _ia().CreateCacheRequest()
+    for pid in (UIA_NAME, UIA_CONTROL_TYPE, UIA_RECT, UIA_OFFSCREEN, UIA_VALUE):
+        cr.AddProperty(pid)
+    if subtree:
+        cr.TreeScope = TREE_SCOPE_SUBTREE
+    return cr
+
+
+ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"))
+
+
+def _norm_title(s: str) -> str:
+    # Edge titles read "... - Microsoft​ Edge"; nobody types the ZWSP.
+    return " ".join(s.translate(ZERO_WIDTH).split()).casefold()
+
+
+def _find_window(target: str = ""):
+    """Window by exact then partial title (case- and zero-width-insensitive),
+    or the foreground window. None if absent."""
     import uiautomation as auto
 
-    if target:
-        win = auto.WindowControl(searchDepth=1, Name=target, searchInterval=0.5)
-        if not win.Exists(1):
-            # Try partial match
-            win = auto.WindowControl(searchDepth=1, SubName=target, searchInterval=0.5)
-        if not win.Exists(1):
-            return f"[Error] Window not found: {target}"
-    else:
-        win = auto.GetForegroundControl()
+    if not target:
+        return auto.GetForegroundControl()
+    want = _norm_title(target)
+    windows = [w for w in auto.GetRootControl().GetChildren() if w.Name]
+    for w in windows:
+        if _norm_title(w.Name) == want:
+            return w
+    for w in windows:
+        if want in _norm_title(w.Name):
+            return w
+    tokens = want.split()
+    for w in windows:
+        if all(tok in _norm_title(w.Name) for tok in tokens):
+            return w
+    return None
 
-    lines = [f"Window: {win.Name}"]
-    count = [0]
 
-    def walk(element, depth):
-        if depth > max_depth or count[0] >= max_nodes:
-            return
-        try:
-            children = element.GetChildren()
-        except Exception:
-            return
-        for child in children:
-            if count[0] >= max_nodes:
-                lines.append(f"{'  ' * depth}... (truncated at {max_nodes} nodes)")
+def _page_roots(win) -> list:
+    """The active tab's top-level Document element(s), cached. Empty if none."""
+    ia = _ia()
+    cond = ia.CreatePropertyCondition(UIA_CONTROL_TYPE, DOCUMENT_TYPE)
+    docs = win.Element.FindAllBuildCache(TREE_SCOPE_DESCENDANTS, cond, _cache_request())
+    roots, rects = [], []
+    for i in range(docs.Length if docs else 0):
+        d = docs.GetElement(i)
+        r = d.CachedBoundingRectangle
+        if d.GetCachedPropertyValue(UIA_OFFSCREEN) or r.right <= r.left:
+            continue
+        # FindAll returns preorder, so an iframe's document comes after its
+        # parent's and lies inside its rect; it's searched as part of the parent.
+        if any(p.left <= r.left and p.top <= r.top and r.right <= p.right
+               and r.bottom <= p.bottom for p in rects):
+            continue
+        roots.append(d)
+        rects.append(r)
+    return roots
+
+
+def _scope_roots(win, scope: str) -> tuple[list, str]:
+    """Resolve scope='page'|'window' to (root elements, label for output)."""
+    if scope != "window":
+        roots = _page_roots(win)
+        if roots:
+            return roots, "page"
+    return [win.Element], "window"
+
+
+def _el_type(el) -> int:
+    return el.GetCachedPropertyValue(UIA_CONTROL_TYPE) or 0
+
+
+def _el_value(el) -> str:
+    v = el.GetCachedPropertyValue(UIA_VALUE)
+    return v if isinstance(v, str) else ""
+
+
+def _clip(s: str, n: int = 80) -> str:
+    s = " ".join(s.split())
+    return s[:n] + "..." if len(s) > n else s
+
+
+def _describe(el, with_pos: bool = True) -> str:
+    """One-line element summary: Type: "Name" @x,y,wxh = value (offscreen)."""
+    line = CONTROL_TYPE_NAMES.get(_el_type(el), "Unknown")
+    name = _clip(el.CachedName or "")
+    if name:
+        line += f': "{name}"'
+    if with_pos:
+        r = el.CachedBoundingRectangle
+        if r.right > r.left:
+            line += f" @{r.left},{r.top},{r.right - r.left}x{r.bottom - r.top}"
+    value = _el_value(el)
+    if value and value != (el.CachedName or ""):
+        line += f" = {_clip(value, 100)}"
+    if with_pos and el.GetCachedPropertyValue(UIA_OFFSCREEN):
+        line += " (offscreen)"
+    return line
+
+
+def _type_ids(control_type: str) -> set[int]:
+    """Control type ids whose name contains the filter ('link' -> Hyperlink)."""
+    f = control_type.lower().removesuffix("control")
+    return {tid for tid, n in CONTROL_TYPE_NAMES.items() if f in n.lower()}
+
+
+def _name_matches(el, name: str) -> bool:
+    """Substring match, or all words present in any order, over Name and Value."""
+    haystack = f"{el.CachedName or ''} {_el_value(el)}".lower()
+    needle = name.lower()
+    return needle in haystack or all(tok in haystack for tok in needle.split())
+
+
+def _find_elements(win, name: str = "", control_type: str = "", scope: str = "page",
+                   max_results: int = 30, wait: float = 2.0) -> tuple[list, str]:
+    """Search the scoped subtree; polls up to `wait` seconds for a match.
+
+    Returns (cached elements, scope label). The elements are live, so patterns
+    (Invoke, Value, ...) can be called on them directly.
+    """
+    ia = _ia()
+    ids = _type_ids(control_type) if control_type else set()
+    if control_type and not ids:
+        raise ValueError(f"Unknown control type: {control_type}")
+    # Filter by type natively when it's unambiguous; that's most of the cost saved.
+    cond = (ia.CreatePropertyCondition(UIA_CONTROL_TYPE, next(iter(ids)))
+            if len(ids) == 1 else ia.CreateTrueCondition())
+    cr = _cache_request()
+    deadline = time.time() + wait
+    while True:
+        roots, label = _scope_roots(win, scope)
+        found = []
+        for root in roots:
+            arr = root.FindAllBuildCache(TREE_SCOPE_DESCENDANTS, cond, cr)
+            for i in range(arr.Length if arr else 0):
+                el = arr.GetElement(i)
+                if ids and _el_type(el) not in ids:
+                    continue
+                if name and not _name_matches(el, name):
+                    continue
+                found.append(el)
+                if len(found) >= max_results:
+                    return found, label
+        if found or time.time() >= deadline:
+            return found, label
+        time.sleep(0.3)
+
+
+def uia_tree(target: str = "", max_depth: int = 8, max_nodes: int = 200,
+             scope: str = "page") -> str:
+    """Dump the accessibility tree, collapsing unnamed wrapper nodes."""
+    win = _find_window(target)
+    if win is None:
+        return f"[Error] Window not found: {target}"
+    roots, label = _scope_roots(win, scope)
+    lines = [f"Window: {win.Name}  (scope: {label})"]
+    count = 0
+
+    def shown(el, parent_name: str) -> bool:
+        ctype = _el_type(el)
+        name = (el.CachedName or "").strip()
+        if ctype in INTERACTIVE_TYPES or _el_value(el):
+            return True
+        if not name:
+            return ctype not in WRAPPER_TYPES
+        # Link/button labels usually repeat as a Text child; drop the echo.
+        return not (ctype == 50020 and name == parent_name)
+
+    def walk(el, depth: int, parent_name: str):
+        nonlocal count
+        kids = el.GetCachedChildren()
+        for i in range(kids.Length if kids else 0):
+            if count >= max_nodes:
                 return
-            count[0] += 1
-            indent = "  " * depth
-            ctype = _uia_control_type_name(child.ControlTypeName and 0 or 0)
-            name = child.Name or ""
-            ctype_name = child.ControlTypeName or "?"
-            value = ""
-            try:
-                vp = child.GetValuePattern()
-                if vp:
-                    value = f" = {vp.Value[:100]}" if vp.Value else ""
-            except Exception:
-                pass
+            child = kids.GetElement(i)
+            if shown(child, parent_name):
+                count += 1
+                lines.append("  " * depth + _describe(child, with_pos=False))
+                if depth < max_depth:
+                    walk(child, depth + 1, (child.CachedName or "").strip())
+            else:
+                walk(child, depth, parent_name)
 
-            # Truncate long names
-            display_name = name[:80] + "..." if len(name) > 80 else name
-            line = f"{indent}{ctype_name}"
-            if display_name:
-                line += f': "{display_name}"'
-            if value:
-                line += value
-            lines.append(line)
-
-            walk(child, depth + 1)
-
-    walk(win, 1)
-    if count[0] >= max_nodes:
-        lines.append(f"\n({count[0]} nodes shown, tree may be larger)")
+    cr = _cache_request(subtree=True)
+    for root in roots:
+        root = root.BuildUpdatedCache(cr)
+        if label == "page":
+            count += 1
+            lines.append("  " + _describe(root, with_pos=False))
+        walk(root, 2 if label == "page" else 1, "")
+    if count >= max_nodes:
+        lines.append(f"... (truncated at {max_nodes} nodes; use ahk_uia_find to search)")
     return "\n".join(lines)
 
 
-def uia_find(target: str = "", name: str = "", control_type: str = "", max_results: int = 30) -> str:
+def uia_find(target: str = "", name: str = "", control_type: str = "", max_results: int = 30,
+             scope: str = "page", wait: float = 2.0) -> str:
     """Find UI elements by name and/or control type."""
-    import uiautomation as auto
-
-    if target:
-        win = auto.WindowControl(searchDepth=1, SubName=target, searchInterval=0.5)
-        if not win.Exists(1):
-            return f"[Error] Window not found: {target}"
-    else:
-        win = auto.GetForegroundControl()
-
-    results = []
-
-    def walk(element, depth):
-        if len(results) >= max_results:
-            return
-        if depth > 8:
-            return
-        try:
-            children = element.GetChildren()
-        except Exception:
-            return
-        for child in children:
-            if len(results) >= max_results:
-                return
-            cname = child.Name or ""
-            ctype = child.ControlTypeName or ""
-
-            match = True
-            if name and name.lower() not in cname.lower():
-                match = False
-            if control_type and control_type.lower() not in ctype.lower():
-                match = False
-            if not name and not control_type:
-                match = False
-
-            if match:
-                rect = child.BoundingRectangle
-                pos = f"@{rect.left},{rect.top},{rect.width()}x{rect.height()}" if rect.width() > 0 else ""
-                value = ""
-                try:
-                    vp = child.GetValuePattern()
-                    if vp and vp.Value:
-                        value = f" = {vp.Value[:100]}"
-                except Exception:
-                    pass
-                display_name = cname[:80] + "..." if len(cname) > 80 else cname
-                results.append(f'{ctype}: "{display_name}" {pos}{value}')
-
-            walk(child, depth + 1)
-
-    walk(win, 0)
-    if not results:
-        return f"No elements found matching name='{name}' type='{control_type}'"
-    header = f"Found {len(results)} element(s) in: {win.Name}\n"
-    return header + "\n".join(results)
+    if not name and not control_type:
+        return "[Error] Give name and/or control_type"
+    win = _find_window(target)
+    if win is None:
+        return f"[Error] Window not found: {target}"
+    found, label = _find_elements(win, name, control_type, scope, max_results, wait)
+    header = f"Window: {win.Name}  (scope: {label})"
+    if not found:
+        return f"{header}\nNo elements found matching name='{name}' type='{control_type}'"
+    lines = [f"{header}\nFound {len(found)} element(s):"]
+    lines += [f"[{i}] {_describe(el)}" for i, el in enumerate(found)]
+    return "\n".join(lines)
 
 
 def uia_url() -> str:
@@ -530,226 +702,757 @@ def uia_url() -> str:
     return f"Window: {title}\nURL: (not found — may not be a browser, or address bar not accessible)"
 
 
+def ahk_win(target: str = "") -> str:
+    """AHK WinTitle for a target: 'A' for the active window, else 'ahk_id N'.
+
+    Resolving in Python keeps matching identical across tools (case- and
+    zero-width-insensitive, word order free) instead of AHK's own rules.
+    """
+    if not target:
+        return "A"
+    win = _find_window(target)
+    if win is None:
+        raise LookupError(f"Window not found: {target}")
+    return f"ahk_id {win.NativeWindowHandle}"
+
+
+# --- UIA actions ---
+#
+# Invoke/Value/Toggle work on occluded windows and on elements scrolled out of
+# view, with no coordinates or cursor. But apps raise their own window when an
+# action focuses an element (browsers always do, Win32 apps on SetValue), so
+# by default a focus guard puts the previous foreground window back.
+
+def _focus_guard(prev: int) -> str:
+    """Restore `prev` as foreground if an action stole it. Returns a note."""
+    user32 = ctypes.windll.user32
+    stolen = False
+    deadline = time.time() + 0.6  # activation can land after the call returns
+    while time.time() < deadline:
+        if user32.GetForegroundWindow() != prev:
+            stolen = True
+            cdp._set_foreground(prev)
+        time.sleep(0.05)
+    return "\nFocus guard: target raised itself; previous window restored" if stolen else ""
+
+
+def _pick(win, name: str, control_type: str, index: int, scope: str, wait: float):
+    import uiautomation as auto
+
+    if control_type:
+        found, _ = _find_elements(win, name, control_type, scope, index + 1, wait)
+    else:
+        # Without a type filter a label or wrapper often matches first; act on
+        # the interactive element it describes instead (the sort is stable).
+        found, _ = _find_elements(win, name, "", scope, max(index + 1, 30), wait)
+        found.sort(key=lambda el: _el_type(el) not in INTERACTIVE_TYPES)
+    if len(found) <= index:
+        return None, (f"[Error] No element [{index}] matching name='{name}' type='{control_type}' "
+                      f"({len(found)} found) in: {win.Name}")
+    return auto.Control.CreateControlFromElement(found[index]), _describe(found[index])
+
+
+def uia_invoke(target: str = "", name: str = "", control_type: str = "", index: int = 0,
+               action: str = "auto", scope: str = "page", wait: float = 2.0,
+               keep_focus: bool = False) -> str:
+    import uiautomation as auto
+
+    if not name and not control_type:
+        return "[Error] Give name and/or control_type"
+    win = _find_window(target)
+    if win is None:
+        return f"[Error] Window not found: {target}"
+    ctl, desc = _pick(win, name, control_type, index, scope, wait)
+    if ctl is None:
+        return desc
+
+    def expand_toggle(p):
+        # ExpandCollapseState: 0 collapsed, 1 expanded, 2 partial, 3 leaf
+        return p.Collapse() if p.ExpandCollapseState == 1 else p.Expand()
+
+    pid = auto.PatternId
+    attempts = {
+        "invoke": [("Invoke", pid.InvokePattern, lambda p: p.Invoke())],
+        "toggle": [("Toggle", pid.TogglePattern, lambda p: p.Toggle())],
+        "select": [("Select", pid.SelectionItemPattern, lambda p: p.Select())],
+        "expand": [("Expand", pid.ExpandCollapsePattern, lambda p: p.Expand())],
+        "collapse": [("Collapse", pid.ExpandCollapsePattern, lambda p: p.Collapse())],
+        "default": [("DoDefaultAction", pid.LegacyIAccessiblePattern,
+                     lambda p: p.DoDefaultAction())],
+    }
+    if action == "focus":
+        plan = [("SetFocus", None, lambda _: ctl.SetFocus())]
+    elif action == "auto":
+        plan = (attempts["invoke"] + attempts["toggle"] + attempts["select"]
+                + [("Expand/Collapse", pid.ExpandCollapsePattern, expand_toggle)]
+                + attempts["default"])
+    elif action in attempts:
+        plan = attempts[action]
+    else:
+        return f"[Error] Unknown action: {action}"
+
+    prev = ctypes.windll.user32.GetForegroundWindow()
+    for label, pattern_id, run in plan:
+        pattern = ctl if pattern_id is None else ctl.GetPattern(pattern_id)
+        if not pattern:
+            continue
+        run(pattern)
+        note = "" if keep_focus else _focus_guard(prev)
+        return f"Window: {win.Name}\n{label}: {desc}{note}"
+    return f"[Error] Element supports none of: {', '.join(p[0] for p in plan)}\n{desc}"
+
+
+def uia_set_value(target: str = "", name: str = "", control_type: str = "Edit",
+                  value: str = "", index: int = 0, scope: str = "page", wait: float = 2.0,
+                  keep_focus: bool = False) -> str:
+    win = _find_window(target)
+    if win is None:
+        return f"[Error] Window not found: {target}"
+    ctl, desc = _pick(win, name, control_type, index, scope, wait)
+    if ctl is None:
+        return desc
+    import uiautomation as auto
+
+    prev = ctypes.windll.user32.GetForegroundWindow()
+    method = "ValuePattern"
+    vp = ctl.GetPattern(auto.PatternId.ValuePattern)
+    if vp:
+        vp.SetValue(value)
+    else:
+        legacy = ctl.GetPattern(auto.PatternId.LegacyIAccessiblePattern)
+        if not legacy:
+            return f"[Error] Element has no settable value\n{desc}"
+        legacy.SetValue(value)
+        method = "LegacyIAccessible"
+    note = "" if keep_focus else _focus_guard(prev)
+    try:
+        now = ctl.GetPattern(auto.PatternId.ValuePattern).Value
+    except Exception:
+        now = None
+    check = "" if now is None else (" (verified)" if now == value else f"\nRead back: {now!r}")
+    return f"Window: {win.Name}\nSet via {method}: {desc}{check}{note}"
+
+
+# --- Browser (Chromium via DevTools Protocol) ---
+
+DEFAULT_BROWSER = os.environ.get("AHK_BROWSER", "edge")
+BROWSER_FLAGS = [
+    # Expose page content to UIA as well (ahk_uia_* on browser windows).
+    "--force-renderer-accessibility",
+    # Keep rendering and the accessibility tree alive while the window is
+    # covered; Chromium otherwise treats fully occluded windows as hidden.
+    "--disable-features=CalculateNativeWinOcclusion",
+    "--disable-backgrounding-occluded-windows",
+]
+
+
+def _browser_ctx(args: dict):
+    b = cdp.get_browser(args.get("browser") or DEFAULT_BROWSER)
+    tab = cdp.resolve_tab(b, args.get("tab"))
+    return b, tab, b.session(tab["targetId"])
+
+
+def _browser_node(b, sid, args: dict) -> tuple[int, str]:
+    """Element from ref='#123' or name/role/index. Returns (backendNodeId, description)."""
+    ref = str(args.get("ref", "")).lstrip("#")
+    if ref:
+        return int(ref), f"#{ref}"
+    name, role = args.get("name", ""), args.get("role", "")
+    if not name and not role:
+        raise ValueError("Give ref, or name and/or role")
+    index = args.get("index", 0)
+    found = cdp.find(b, sid, name, role, index + 1, args.get("wait", 2.0))
+    if len(found) <= index:
+        raise LookupError(f"No element [{index}] matching name='{name}' role='{role}' "
+                          f"({len(found)} found)")
+    return found[index]["backendDOMNodeId"], cdp.describe(found[index])
+
+
+def browser_launch(browser: str = "", url: str = "", restart: bool = False) -> str:
+    browser = browser or DEFAULT_BROWSER
+    exe = cdp.BROWSER_EXES[browser]
+    running = bool(cdp._pids(exe))
+    lines = []
+    if running and restart:
+        # WM_CLOSE each window so the session is saved and restored on relaunch.
+        run_ahk(f'#Requires AutoHotkey v2.0\nfor h in WinGetList("ahk_exe {exe}")\n'
+                f'    if WinGetTitle(h) != ""\n        PostMessage 0x10, 0, 0, , h\nExitApp')
+        deadline = time.time() + 15
+        while cdp._pids(exe) and time.time() < deadline:
+            time.sleep(0.5)
+        if cdp._pids(exe):
+            return f"[Error] {browser} didn't close within 15s (an unsaved-form prompt?)"
+        running = False
+        lines.append(f"Closed {browser}; relaunching with automation flags.")
+    if running:
+        if url:
+            subprocess.Popen(["cmd", "/c", "start", "", exe.removesuffix(".exe"), url],
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+            lines.append(f"Opened {url} in the running {browser}.")
+        lines.append(f"{browser} was already running, so launch flags weren't applied; "
+                     "pass restart=true to relaunch with them (the session is restored).")
+    else:
+        argv = [exe.removesuffix(".exe"), *BROWSER_FLAGS]
+        argv += ["--restore-last-session"] if restart else []
+        argv += [url] if url else []
+        subprocess.Popen(["cmd", "/c", "start", "", *argv],
+                         creationflags=subprocess.CREATE_NO_WINDOW)
+        lines.append(f"Launched {browser} with: {' '.join(BROWSER_FLAGS)}")
+        deadline = time.time() + 10
+        while time.time() < deadline and not cdp._browser_window(browser):
+            time.sleep(0.3)
+    port_file = cdp.USER_DATA_DIRS[browser] / "DevToolsActivePort"
+    deadline = time.time() + 5
+    while not port_file.exists() and time.time() < deadline:
+        time.sleep(0.3)
+    if port_file.exists():
+        lines.append("DevTools remote debugging is enabled. The first ahk_browser_* call "
+                     f"brings {browser} forward once to approve the connection.")
+    else:
+        lines.append(f"DevTools remote debugging is OFF. To enable (one-time, persists): open "
+                     f"{cdp.ENABLE_URLS[browser]} and tick 'Allow remote debugging for this "
+                     "browser instance'. Until then only ahk_uia_* tools work on it.")
+    return "\n".join(lines)
+
+
+def browser_find(args: dict) -> str:
+    b, tab, sid = _browser_ctx(args)
+    name, role = args.get("name", ""), args.get("role", "")
+    if not name and not role:
+        return "[Error] Give name and/or role"
+    found = cdp.find(b, sid, name, role, args.get("max_results", 30), args.get("wait", 2.0))
+    header = f"Tab: {tab['title'][:80]}  | {tab['url'][:80]}"
+    if not found:
+        return f"{header}\nNo elements found matching name='{name}' role='{role}'"
+    return "\n".join([f"{header}\nFound {len(found)} element(s) (#N = ref):"]
+                     + [f"[{i}] {cdp.describe(n)}" for i, n in enumerate(found)])
+
+
+def browser_click(args: dict) -> str:
+    b, tab, sid = _browser_ctx(args)
+    button, count = args.get("button", "left"), args.get("count", 1)
+    if "x" in args and "y" in args:
+        cdp.click_at(b, sid, args["x"], args["y"], button, count)
+        what = f"viewport {args['x']},{args['y']}"
+    else:
+        node, what = _browser_node(b, sid, args)
+        x, y = cdp.click_node(b, sid, node, button, count)
+        what += f" @{x:.0f},{y:.0f}"
+    time.sleep(0.3)
+    return f"Clicked: {what} ({button} x{count})\nNow: {cdp.page_state(b, sid)}"
+
+
+def browser_type(args: dict) -> str:
+    b, tab, sid = _browser_ctx(args)
+    done = []
+    if args.get("ref") or args.get("name") or args.get("role"):
+        node, what = _browser_node(b, sid, args)
+        cdp.focus_node(b, sid, node)
+        done.append(f"Focused: {what}")
+    if args.get("clear"):
+        cdp.press_keys(b, sid, "Ctrl+A Backspace")
+        done.append("Cleared")
+    if args.get("text"):
+        cdp.insert_text(b, sid, args["text"])
+        done.append(f"Typed: {len(args['text'])} chars")
+    if args.get("keys"):
+        cdp.press_keys(b, sid, args["keys"])
+        done.append(f"Keys: {args['keys']}")
+    if not done:
+        return "[Error] Give text and/or keys"
+    time.sleep(0.2)
+    return "\n".join(done + [f"Now: {cdp.page_state(b, sid)}"])
+
+
+def browser_navigate(args: dict) -> str:
+    b = cdp.get_browser(args.get("browser") or DEFAULT_BROWSER)
+    if args.get("new_tab"):
+        # background=True: the new tab doesn't become the selected tab
+        target = b.send("Target.createTarget", {"url": "about:blank", "background": True})
+        sid = b.session(target["targetId"])
+    else:
+        sid = b.session(cdp.resolve_tab(b, args.get("tab"))["targetId"])
+    return f"Loaded: {cdp.navigate(b, sid, args['url'])}"
+
+
+def browser_dispatch(name: str, args: dict) -> str:
+    if name == "ahk_browser_launch":
+        return browser_launch(args.get("browser", ""), args.get("url", ""),
+                              args.get("restart", False))
+    if name == "ahk_browser_tabs":
+        b = cdp.get_browser(args.get("browser") or DEFAULT_BROWSER)
+        return cdp.list_tabs(b)
+    if name == "ahk_browser_find":
+        return browser_find(args)
+    if name == "ahk_browser_tree":
+        b, tab, sid = _browser_ctx(args)
+        return cdp.tree(b, sid, args.get("max_depth", 8), args.get("max_nodes", 200))
+    if name == "ahk_browser_click":
+        return browser_click(args)
+    if name == "ahk_browser_type":
+        return browser_type(args)
+    if name == "ahk_browser_navigate":
+        return browser_navigate(args)
+    if name == "ahk_browser_eval":
+        b, tab, sid = _browser_ctx(args)
+        value = cdp.evaluate(b, sid, args["script"], args.get("timeout", 30))
+        return json.dumps(value, ensure_ascii=False, indent=1) if not isinstance(value, str) else value
+    return f"Unknown tool: {name}"
+
+
 # --- MCP Server ---
 
-server = Server("ahk-mcp")
+TOOLS = [
+    types.Tool(
+        name="ahk_windows",
+        description="List all visible windows with title, class, PID, and position. "
+        "Use this instead of screenshots to understand what's on screen.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="ahk_focus",
+        description="Activate/focus a window by title (supports partial match). "
+        "Example: 'Notepad', 'Chrome', 'Visual Studio'.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Window title (partial match OK)",
+                },
+            },
+            "required": ["target"],
+        },
+    ),
+    types.Tool(
+        name="ahk_send",
+        description="Send keystrokes to a window (takes focus). Uses AHK Send syntax: "
+        "{Enter}, {Tab}, ^c (Ctrl+C), !{F4} (Alt+F4), +{Home} (Shift+Home), etc. "
+        "Pass target= so focus and keys happen atomically. For plain text use ahk_type; "
+        "for background input see ahk_control_send / ahk_browser_type.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window to activate first, verified, in the same call (title words, any order). Recommended: focus set by an earlier call is usually lost by the time this runs."},
+                "keys": {
+                    "type": "string",
+                    "description": "AHK v2 Send key sequence",
+                },
+            },
+            "required": ["keys"],
+        },
+    ),
+    types.Tool(
+        name="ahk_type",
+        description="Type plain text into a window (SendText — no special key interpretation; "
+        "takes focus). Pass target= so focus and typing happen atomically.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window to activate first, verified, in the same call (title words, any order). Recommended: focus set by an earlier call is usually lost by the time this runs."},
+                "text": {
+                    "type": "string",
+                    "description": "Text to type",
+                },
+            },
+            "required": ["text"],
+        },
+    ),
+    types.Tool(
+        name="ahk_click",
+        description="Click at screen coordinates with the real cursor (takes focus). Pass target= "
+        "so the window is in front when the click lands. Background alternatives: "
+        "ahk_uia_invoke, ahk_control_click, ahk_browser_click.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window to activate first, verified, in the same call (title words, any order). Recommended: focus set by an earlier call is usually lost by the time this runs."},
+                "x": {"type": "integer", "description": "X coordinate"},
+                "y": {"type": "integer", "description": "Y coordinate"},
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle"],
+                    "description": "Mouse button (default: left)",
+                },
+            },
+            "required": ["x", "y"],
+        },
+    ),
+    types.Tool(
+        name="ahk_read",
+        description="Read all text content from a window. "
+        "Much cheaper than a screenshot — returns actual text, not pixels.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Window title (omit for active window)",
+                },
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_window_info",
+        description="Get detailed info about a window: title, class, PID, process name, "
+        "position, size, and its Win32 controls (ClassNN names, for ahk_control_send/click) with their text.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window title words (omit for active window)"},
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_clipboard",
+        description="Get or set the system clipboard.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["get", "set"],
+                    "description": "Get or set clipboard",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to set (only for action=set)",
+                },
+            },
+            "required": ["action"],
+        },
+    ),
+    types.Tool(
+        name="ahk_run",
+        description="Launch a program or open a file/URL.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Program path, file, or URL to open",
+                },
+            },
+            "required": ["target"],
+        },
+    ),
+    types.Tool(
+        name="ahk_msgbox",
+        description="Show a message box to the user. Useful for notifications or confirmations.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "Message body"},
+                "title": {"type": "string", "description": "Window title (default: AHK-MCP)"},
+            },
+            "required": ["message"],
+        },
+    ),
+    types.Tool(
+        name="ahk_screenshot",
+        description="Capture a screenshot of a window, region, or full screen. Returns a PNG file path "
+        "— use the Read tool to view it. Per-window captures use PrintWindow (works even when "
+        "occluded). Specify x/y/w/h for a region crop relative to the window or screen.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Window title (partial match), 'screen' for full desktop, or omit for active window",
+                },
+                "x": {"type": "integer", "description": "Region X offset (relative to window/screen)"},
+                "y": {"type": "integer", "description": "Region Y offset"},
+                "w": {"type": "integer", "description": "Region width"},
+                "h": {"type": "integer", "description": "Region height"},
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_uia_tree",
+        description="Dump the UI Automation accessibility tree of a window. Returns element types, "
+        "names, and values in a structured text format. This is how you read browser content, "
+        "form fields, and UI state that WinGetText can't see. In browsers it shows the active "
+        "tab's page by default; unnamed layout wrappers are collapsed and don't count toward depth.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window title (omit for active window)"},
+                "max_depth": {"type": "integer", "description": "Max depth of shown nodes (default: 8)"},
+                "max_nodes": {"type": "integer", "description": "Max nodes to return (default: 200)"},
+                "scope": {
+                    "type": "string",
+                    "enum": ["page", "window"],
+                    "description": "'page' (default): the active browser tab's document, or the whole "
+                    "window if it has none. 'window': everything, including browser chrome and "
+                    "background tabs.",
+                },
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_uia_find",
+        description="Search for UI elements by name and/or control type within a window. "
+        "Returns numbered matches with position and value. Searches the full depth of the tree "
+        "(browser page content sits 10-35 levels deep). Name matching is token-based: all words, "
+        "any order. Polls briefly (wait=, default 2s) so pages still rendering after a click "
+        "are caught. Useful for finding buttons, links, inputs, or any named element.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window title (omit for active window)"},
+                "name": {"type": "string", "description": "Text to match in element name/value (all words, any order)"},
+                "control_type": {"type": "string", "description": "Control type: Button, Edit, Hyperlink, Text, etc. (partial match: 'link' = Hyperlink)"},
+                "max_results": {"type": "integer", "description": "Max results (default: 30)"},
+                "scope": {
+                    "type": "string",
+                    "enum": ["page", "window"],
+                    "description": "'page' (default): the active browser tab's document, or the whole "
+                    "window if it has none. 'window': everything, including browser chrome and "
+                    "background tabs.",
+                },
+                "wait": {"type": "number", "description": "Seconds to poll for a match before returning empty (default 2; 0 = check once)"},
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_uia_url",
+        description="Get the URL from the active browser's address bar via UI Automation. "
+        "Works with Firefox, Chrome, and Edge.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="ahk_eval",
+        description="Execute arbitrary AHK v2 code. Output via: FileAppend \"text\", \"*\" "
+        "and end with ExitApp. This is the escape hatch for anything the other tools can't do. "
+        "Full AHK v2 language available: COM objects, UI Automation, regex, file I/O, etc.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "script": {
+                    "type": "string",
+                    "description": "AHK v2 script code",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default: 10)",
+                },
+            },
+            "required": ["script"],
+        },
+    ),
+    # --- Background actions: UIA (any app; focus guarded) ---
+    types.Tool(
+        name="ahk_uia_invoke",
+        description="Find a UI element (same matching as ahk_uia_find) and act on it through UI "
+        "Automation: no coordinates, no cursor, works on occluded windows and elements scrolled "
+        "out of view. action=auto tries Invoke, Toggle, Select, Expand/Collapse, then the default "
+        "action. Many apps (all browsers) raise their window when acted on; a focus guard puts "
+        "the previous foreground window back. For Chromium prefer ahk_browser_click (no flash).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window title words (omit for active window)"},
+                "name": {"type": "string", "description": "Text in element name/value (all words, any order)"},
+                "control_type": {"type": "string", "description": "Button, Hyperlink, CheckBox, ListItem, MenuItem, TabItem, ..."},
+                "index": {"type": "integer", "description": "Which match (0-based, default 0), as numbered by ahk_uia_find"},
+                "action": {"type": "string", "enum": ["auto", "invoke", "toggle", "select", "expand", "collapse", "focus", "default"]},
+                "scope": {"type": "string", "enum": ["page", "window"], "description": "As in ahk_uia_find (default page)"},
+                "wait": {"type": "number", "description": "Seconds to poll for the element (default 2)"},
+                "keep_focus": {"type": "boolean", "description": "Let the target keep focus if it takes it (default false)"},
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_uia_set_value",
+        description="Set the text of an input through UI Automation (ValuePattern) without typing: "
+        "no focus needed, fires real input/change events (React-style apps see it). Works for "
+        "native edit boxes and browser inputs; contenteditable editors need ahk_browser_type. "
+        "Focus guarded like ahk_uia_invoke.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window title words (omit for active window)"},
+                "name": {"type": "string", "description": "Field name/label text (all words, any order)"},
+                "control_type": {"type": "string", "description": "Default Edit; ComboBox for editable combos"},
+                "value": {"type": "string", "description": "The full new value (replaces existing text)"},
+                "index": {"type": "integer", "description": "Which match (0-based, default 0)"},
+                "scope": {"type": "string", "enum": ["page", "window"]},
+                "wait": {"type": "number", "description": "Seconds to poll for the element (default 2)"},
+                "keep_focus": {"type": "boolean", "description": "Let the target keep focus if it takes it (default false)"},
+            },
+            "required": ["value"],
+        },
+    ),
+    # --- Background actions: posted window messages (classic Win32 only) ---
+    types.Tool(
+        name="ahk_control_send",
+        description="Send text or keys to a window/control in the background via posted messages "
+        "(AHK ControlSend). True background: no focus change, no flash. Only classic Win32 "
+        "controls respond (dialogs, older apps, AHK GUIs); browsers, WinUI/UWP apps (Win11 "
+        "Notepad, Settings) and most Electron apps ignore it. Get control names from ahk_window_info.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window title words"},
+                "control": {"type": "string", "description": "ClassNN like Edit1 (omit: the window's focused control)"},
+                "text": {"type": "string", "description": "Literal text to send"},
+                "keys": {"type": "string", "description": "Key sequence in AHK Send syntax ({Enter}, ^a, ...); set raw=true"},
+                "raw": {"type": "boolean", "description": "Interpret keys= as AHK key syntax (default false: literal text)"},
+            },
+            "required": ["target"],
+        },
+    ),
+    types.Tool(
+        name="ahk_control_click",
+        description="Click a control (or client-area x,y) in a background window via posted "
+        "messages (AHK ControlClick NA). No cursor movement, no focus change. Classic Win32 "
+        "only, like ahk_control_send.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Window title words"},
+                "control": {"type": "string", "description": "ClassNN like Button1, or the control's text"},
+                "x": {"type": "integer", "description": "Client-area X (when no control given)"},
+                "y": {"type": "integer", "description": "Client-area Y (when no control given)"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                "count": {"type": "integer", "description": "Click count (default 1)"},
+            },
+            "required": ["target"],
+        },
+    ),
+    # --- Browser: Chromium (Edge/Chrome) via DevTools Protocol, true background ---
+    types.Tool(
+        name="ahk_browser_launch",
+        description="Start Edge/Chrome (your normal profile) with flags that keep pages readable "
+        "and controllable while the window is covered, and report whether DevTools remote "
+        "debugging (needed by ahk_browser_*) is enabled. restart=true closes and relaunches a "
+        "running browser with the flags, restoring its tabs.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "browser": {"type": "string", "enum": ["edge", "chrome"], "description": "Default edge (env AHK_BROWSER)"},
+                "url": {"type": "string", "description": "Optional URL to open"},
+                "restart": {"type": "boolean", "description": "Relaunch a running browser to apply the flags"},
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_browser_tabs",
+        description="List open tabs in Edge/Chrome as [index] title | url. Index or title/URL "
+        "text can be passed as tab= to the other ahk_browser_* tools.",
+        inputSchema={
+            "type": "object",
+            "properties": {"browser": {"type": "string", "enum": ["edge", "chrome"]}},
+        },
+    ),
+    types.Tool(
+        name="ahk_browser_find",
+        description="Search a Chromium tab's accessibility tree by name and/or role. Returns "
+        "numbered matches with a #ref for ahk_browser_click/type. Name matching: all words, any "
+        "order. Polls briefly (wait=) for pages still rendering. Works in the background.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Text in accessible name/value (all words, any order)"},
+                "role": {"type": "string", "description": "button, link, textbox, checkbox, combobox, heading, ... (partial match)"},
+                "tab": {"type": "string", "description": "Tab index or title/URL text (default: the visible tab)"},
+                "max_results": {"type": "integer", "description": "Default 30"},
+                "wait": {"type": "number", "description": "Seconds to poll for a match (default 2)"},
+                "browser": {"type": "string", "enum": ["edge", "chrome"]},
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_browser_tree",
+        description="Dump a Chromium tab's accessibility tree (roles, names, values, states, "
+        "#refs) with layout wrappers collapsed. The structured way to read a page.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "tab": {"type": "string", "description": "Tab index or title/URL text (default: the visible tab)"},
+                "max_depth": {"type": "integer", "description": "Max depth of shown nodes (default 8)"},
+                "max_nodes": {"type": "integer", "description": "Max nodes (default 200)"},
+                "browser": {"type": "string", "enum": ["edge", "chrome"]},
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_browser_click",
+        description="Click an element in a Chromium tab in the background: scrolls it into view "
+        "and sends renderer-level mouse events. No cursor, no focus change, works with the "
+        "window covered. Target by ref (from find/tree), name/role/index, or viewport x,y. "
+        "Returns the page title/URL afterward.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Element ref like #123 from ahk_browser_find/tree"},
+                "name": {"type": "string", "description": "Accessible name text (all words, any order)"},
+                "role": {"type": "string", "description": "Role filter (partial match)"},
+                "index": {"type": "integer", "description": "Which match (0-based, default 0)"},
+                "x": {"type": "number", "description": "Viewport X in CSS pixels (instead of an element)"},
+                "y": {"type": "number", "description": "Viewport Y in CSS pixels"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                "count": {"type": "integer", "description": "2 for double-click"},
+                "tab": {"type": "string", "description": "Tab index or title/URL text (default: the visible tab)"},
+                "browser": {"type": "string", "enum": ["edge", "chrome"]},
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_browser_type",
+        description="Type into a Chromium tab in the background: optionally focus an element "
+        "(ref or name/role), optionally clear it, insert text, then press keys. Works with "
+        "inputs, React-controlled fields and contenteditable editors. No focus change.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text to insert"},
+                "keys": {"type": "string", "description": "Keys after the text, e.g. 'Enter', 'Tab', 'Ctrl+A', 'Shift+Tab'; space-separated sequence"},
+                "ref": {"type": "string", "description": "Element to focus first, like #123"},
+                "name": {"type": "string", "description": "Element to focus first, by accessible name"},
+                "role": {"type": "string", "description": "Role filter for name (e.g. textbox)"},
+                "index": {"type": "integer", "description": "Which match (0-based, default 0)"},
+                "clear": {"type": "boolean", "description": "Select all and delete before typing"},
+                "tab": {"type": "string", "description": "Tab index or title/URL text (default: the visible tab)"},
+                "browser": {"type": "string", "enum": ["edge", "chrome"]},
+            },
+        },
+    ),
+    types.Tool(
+        name="ahk_browser_navigate",
+        description="Load a URL in a Chromium tab (or a new background tab) and wait for it to "
+        "finish loading. Returns the resulting title and URL.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "new_tab": {"type": "boolean", "description": "Open in a new background tab"},
+                "tab": {"type": "string", "description": "Tab index or title/URL text (default: the visible tab)"},
+                "browser": {"type": "string", "enum": ["edge", "chrome"]},
+            },
+            "required": ["url"],
+        },
+    ),
+    types.Tool(
+        name="ahk_browser_eval",
+        description="Evaluate JavaScript in a Chromium tab and return the result (JSON). Promises "
+        "are awaited. The escape hatch for page state the accessibility tree doesn't show.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "script": {"type": "string", "description": "JS expression"},
+                "tab": {"type": "string", "description": "Tab index or title/URL text (default: the visible tab)"},
+                "timeout": {"type": "integer", "description": "Seconds (default 30)"},
+                "browser": {"type": "string", "enum": ["edge", "chrome"]},
+            },
+            "required": ["script"],
+        },
+    ),
+]
 
 
-@server.list_tools()
-async def list_tools() -> list[types.Tool]:
-    return [
-        types.Tool(
-            name="ahk_windows",
-            description="List all visible windows with title, class, PID, and position. "
-            "Use this instead of screenshots to understand what's on screen.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="ahk_focus",
-            description="Activate/focus a window by title (supports partial match). "
-            "Example: 'Notepad', 'Chrome', 'Visual Studio'.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "Window title (partial match OK)",
-                    },
-                },
-                "required": ["target"],
-            },
-        ),
-        types.Tool(
-            name="ahk_send",
-            description="Send keystrokes to the active window. Uses AHK Send syntax: "
-            "{Enter}, {Tab}, ^c (Ctrl+C), !{F4} (Alt+F4), +{Home} (Shift+Home), etc. "
-            "For plain text, use ahk_type instead.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "keys": {
-                        "type": "string",
-                        "description": "AHK v2 Send key sequence",
-                    },
-                },
-                "required": ["keys"],
-            },
-        ),
-        types.Tool(
-            name="ahk_type",
-            description="Type plain text into the active window (SendText — no special key interpretation).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Text to type",
-                    },
-                },
-                "required": ["text"],
-            },
-        ),
-        types.Tool(
-            name="ahk_click",
-            description="Click at screen coordinates. Use ahk_window_info to find control positions.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "x": {"type": "integer", "description": "X coordinate"},
-                    "y": {"type": "integer", "description": "Y coordinate"},
-                    "button": {
-                        "type": "string",
-                        "enum": ["left", "right", "middle"],
-                        "description": "Mouse button (default: left)",
-                    },
-                },
-                "required": ["x", "y"],
-            },
-        ),
-        types.Tool(
-            name="ahk_read",
-            description="Read all text content from a window. "
-            "Much cheaper than a screenshot — returns actual text, not pixels.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "Window title (omit for active window)",
-                    },
-                },
-            },
-        ),
-        types.Tool(
-            name="ahk_window_info",
-            description="Get detailed info about the active window: title, class, PID, "
-            "process name, position, size, and list of UI controls with their text.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="ahk_clipboard",
-            description="Get or set the system clipboard.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["get", "set"],
-                        "description": "Get or set clipboard",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Content to set (only for action=set)",
-                    },
-                },
-                "required": ["action"],
-            },
-        ),
-        types.Tool(
-            name="ahk_run",
-            description="Launch a program or open a file/URL.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "Program path, file, or URL to open",
-                    },
-                },
-                "required": ["target"],
-            },
-        ),
-        types.Tool(
-            name="ahk_msgbox",
-            description="Show a message box to the user. Useful for notifications or confirmations.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "Message body"},
-                    "title": {"type": "string", "description": "Window title (default: AHK-MCP)"},
-                },
-                "required": ["message"],
-            },
-        ),
-        types.Tool(
-            name="ahk_screenshot",
-            description="Capture a screenshot of a window, region, or full screen. Returns a PNG file path "
-            "— use the Read tool to view it. Per-window captures use PrintWindow (works even when "
-            "occluded). Specify x/y/w/h for a region crop relative to the window or screen.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "Window title (partial match), 'screen' for full desktop, or omit for active window",
-                    },
-                    "x": {"type": "integer", "description": "Region X offset (relative to window/screen)"},
-                    "y": {"type": "integer", "description": "Region Y offset"},
-                    "w": {"type": "integer", "description": "Region width"},
-                    "h": {"type": "integer", "description": "Region height"},
-                },
-            },
-        ),
-        types.Tool(
-            name="ahk_uia_tree",
-            description="Dump the UI Automation accessibility tree of a window. Returns element types, "
-            "names, and values in a structured text format. This is how you read browser content, "
-            "form fields, and UI state that WinGetText can't see.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {"type": "string", "description": "Window title (omit for active window)"},
-                    "max_depth": {"type": "integer", "description": "Max tree depth (default: 4)"},
-                    "max_nodes": {"type": "integer", "description": "Max nodes to return (default: 200)"},
-                },
-            },
-        ),
-        types.Tool(
-            name="ahk_uia_find",
-            description="Search for UI elements by name and/or control type within a window. "
-            "Returns matching elements with position and value. Useful for finding buttons, "
-            "links, inputs, or any named element.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {"type": "string", "description": "Window title (omit for active window)"},
-                    "name": {"type": "string", "description": "Element name to search for (partial match)"},
-                    "control_type": {"type": "string", "description": "Control type: Button, Edit, Hyperlink, Text, etc."},
-                    "max_results": {"type": "integer", "description": "Max results (default: 30)"},
-                },
-            },
-        ),
-        types.Tool(
-            name="ahk_uia_url",
-            description="Get the URL from the active browser's address bar via UI Automation. "
-            "Works with Firefox, Chrome, and Edge.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="ahk_eval",
-            description="Execute arbitrary AHK v2 code. Output via: FileAppend \"text\", \"*\" "
-            "and end with ExitApp. This is the escape hatch for anything the other tools can't do. "
-            "Full AHK v2 language available: COM objects, UI Automation, regex, file I/O, etc.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "script": {
-                        "type": "string",
-                        "description": "AHK v2 script code",
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Timeout in seconds (default: 10)",
-                    },
-                },
-                "required": ["script"],
-            },
-        ),
-    ]
-
-
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+def dispatch(name: str, arguments: dict) -> str:
+    """Run one tool synchronously. Called from a worker thread."""
     result = ""
 
     if name == "ahk_windows":
@@ -767,22 +1470,23 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = "\n".join(lines)
 
     elif name == "ahk_focus":
-        target = escape_ahk(arguments["target"])
+        target = escape_ahk(ahk_win(arguments["target"]))
         result = run_ahk(SCRIPT_FOCUS.format(target=target))
 
     elif name == "ahk_send":
         keys = escape_ahk(arguments["keys"])
-        result = run_ahk(SCRIPT_SEND.format(keys=keys))
+        result = run_ahk(SCRIPT_SEND.format(keys=keys, win=ahk_win(arguments.get("target", ""))))
 
     elif name == "ahk_type":
         text = escape_ahk(arguments["text"])
-        result = run_ahk(SCRIPT_SEND_TEXT.format(text=text))
+        result = run_ahk(SCRIPT_SEND_TEXT.format(text=text, win=ahk_win(arguments.get("target", ""))))
 
     elif name == "ahk_click":
         x = arguments["x"]
         y = arguments["y"]
         button = arguments.get("button", "left")
-        result = run_ahk(SCRIPT_CLICK.format(x=x, y=y, button=button))
+        result = run_ahk(SCRIPT_CLICK.format(x=x, y=y, button=button,
+                                             win=ahk_win(arguments.get("target", ""))))
 
     elif name == "ahk_read":
         target = arguments.get("target", "")
@@ -792,7 +1496,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = run_ahk(SCRIPT_READ)
 
     elif name == "ahk_window_info":
-        result = run_ahk(SCRIPT_WINDOW_INFO)
+        result = run_ahk(SCRIPT_WINDOW_INFO.format(win=ahk_win(arguments.get("target", ""))))
 
     elif name == "ahk_clipboard":
         action = arguments["action"]
@@ -828,10 +1532,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     elif name == "ahk_uia_tree":
         target = arguments.get("target", "")
-        max_depth = arguments.get("max_depth", 4)
+        max_depth = arguments.get("max_depth", 8)
         max_nodes = arguments.get("max_nodes", 200)
+        scope = arguments.get("scope", "page")
         try:
-            result = uia_tree(target, max_depth, max_nodes)
+            result = uia_tree(target, max_depth, max_nodes, scope)
         except Exception as e:
             result = f"[UIA Error] {e}"
 
@@ -840,8 +1545,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         uia_name = arguments.get("name", "")
         control_type = arguments.get("control_type", "")
         max_results = arguments.get("max_results", 30)
+        scope = arguments.get("scope", "page")
+        wait = arguments.get("wait", 2.0)
         try:
-            result = uia_find(target, uia_name, control_type, max_results)
+            result = uia_find(target, uia_name, control_type, max_results, scope, wait)
         except Exception as e:
             result = f"[UIA Error] {e}"
 
@@ -851,6 +1558,41 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         except Exception as e:
             result = f"[UIA Error] {e}"
 
+    elif name == "ahk_uia_invoke":
+        result = uia_invoke(
+            arguments.get("target", ""), arguments.get("name", ""),
+            arguments.get("control_type", ""), arguments.get("index", 0),
+            arguments.get("action", "auto"), arguments.get("scope", "page"),
+            arguments.get("wait", 2.0), arguments.get("keep_focus", False),
+        )
+
+    elif name == "ahk_uia_set_value":
+        result = uia_set_value(
+            arguments.get("target", ""), arguments.get("name", ""),
+            arguments.get("control_type", "Edit"), arguments["value"],
+            arguments.get("index", 0), arguments.get("scope", "page"),
+            arguments.get("wait", 2.0), arguments.get("keep_focus", False),
+        )
+
+    elif name == "ahk_control_send":
+        raw = arguments.get("raw", False)
+        result = run_ahk(SCRIPT_CONTROL_SEND.format(
+            win=ahk_win(arguments["target"]), control=escape_ahk(arguments.get("control", "")),
+            keys=escape_ahk(arguments.get("keys") or arguments.get("text", "")),
+            send_cmd="ControlSend" if raw else "ControlSendText",
+            mode="keys" if raw else "text",
+        ))
+
+    elif name == "ahk_control_click":
+        result = run_ahk(SCRIPT_CONTROL_CLICK.format(
+            win=ahk_win(arguments["target"]), control=escape_ahk(arguments.get("control", "")),
+            x=int(arguments.get("x", 0)), y=int(arguments.get("y", 0)),
+            button=arguments.get("button", "left"), count=int(arguments.get("count", 1)),
+        ))
+
+    elif name.startswith("ahk_browser_"):
+        result = browser_dispatch(name, arguments)
+
     elif name == "ahk_eval":
         script = arguments["script"]
         timeout = arguments.get("timeout", AHK_TIMEOUT)
@@ -859,19 +1601,47 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     else:
         result = f"Unknown tool: {name}"
 
-    return [types.TextContent(type="text", text=result or "(no output)")]
+    return result or "(no output)"
+
+
+def _dispatch_in_thread(name: str, arguments: dict) -> str:
+    # uiautomation is COM-based; each worker thread needs its own COM init.
+    import uiautomation as auto
+    with auto.UIAutomationInitializerInThread():
+        return dispatch(name, arguments)
+
+
+ERROR_PREFIXES = ("[Error]", "[AHK Error]", "[UIA Error]", "Unknown tool:")
+
+
+async def list_tools(ctx, params) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=TOOLS)
+
+
+async def call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
+    # The 2.x lowlevel server doesn't validate arguments against inputSchema,
+    # so a missing required argument surfaces here as a KeyError.
+    try:
+        result = await anyio.to_thread.run_sync(
+            _dispatch_in_thread, params.name, params.arguments or {}
+        )
+    except KeyError as e:
+        result = f"[Error] Missing required argument: {e.args[0]}"
+    except Exception as e:
+        result = f"[Error] {type(e).__name__}: {e}"
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=result)],
+        is_error=result.startswith(ERROR_PREFIXES),
+    )
+
+
+server = Server("ahk-mcp", on_list_tools=list_tools, on_call_tool=call_tool)
 
 
 async def main():
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream, write_stream,
-            server.create_initialization_options(
-                notification_options=NotificationOptions()
-            ),
-        )
+        await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
 if __name__ == "__main__":
-    import anyio
     anyio.run(main)
