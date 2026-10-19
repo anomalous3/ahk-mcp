@@ -91,6 +91,32 @@ Replace `YOUR_USER` with your Windows username. The `PYTHONIOENCODING` env var p
 
 After adding the config, restart Claude Code. The tools will appear with the `mcp__ahk__` prefix.
 
+## Codex MCP configuration
+
+Add this to `~/.codex/config.toml`, replacing the paths with your clone's absolute paths:
+
+```toml
+[mcp_servers.ahk]
+command = "C:/Users/YOUR_USER/ahk-mcp/.venv/Scripts/python.exe"
+args = ["C:/Users/YOUR_USER/ahk-mcp/server.py"]
+
+[mcp_servers.ahk.env]
+PYTHONIOENCODING = "utf-8"
+PYTHONUNBUFFERED = "1"
+```
+
+Use the Python environment where you installed the server's dependencies. Forward slashes avoid Windows path escaping in TOML. If AutoHotkey is installed elsewhere, add `AHK_EXE` to the environment table above.
+
+Restart Codex after changing the configuration. Run `codex mcp list` to check registration, then ask Codex to call `ahk_windows` to verify the server can observe the desktop. Registration alone does not verify that tools work.
+
+AHK does not require lifecycle hooks. If you also use Ember memory, configure its MCP server and install its Codex lifecycle hooks using the installer in the Ember repository. Keep personal paths and generated hook configuration in your user configuration; they do not belong in this repository.
+
+### Voice-driven use
+
+For a conversational demo, carry out each requested action and wait for the next request. Pass `target=` with foreground input so the action reaches the intended window even if focus changes between calls. Use element refs from `ahk_uia_find` to select controls, and prefer explicit controls such as **Pause** over playback toggle keys.
+
+Report completion only after the tool succeeds, and check the resulting state when it matters: **Play** after pausing a video, the destination title or URL after navigation, and an active recording indicator after starting capture. Voice narration alone does not execute an action. Screen recording is a separate application workflow; verify its state and microphone/system audio settings before saying it is recording.
+
 ## Tool reference
 
 ### Observation
