@@ -61,23 +61,26 @@ BROWSER_EXES = {"edge": "msedge.exe", "chrome": "chrome.exe"}
 APPROVAL_TIMEOUT = 90
 
 
-def _browser_window(browser: str) -> int:
-    """Top-level window handle of a running browser, or 0."""
+def _browser_window(browser: str, prefer: str = "") -> int:
+    """Top-level window handle of a running browser, or 0. With `prefer`, a
+    window whose title contains it wins (the approval prompt is its own window)."""
     user32 = ctypes.windll.user32
     pids = _pids(BROWSER_EXES[browser])
     found = []
     pid = wintypes.DWORD()
+    buf = ctypes.create_unicode_buffer(256)
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def cb(hwnd, _):
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         if pid.value in pids and user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd):
-            found.append(hwnd)
-            return False
+            user32.GetWindowTextW(hwnd, buf, 256)
+            found.append((prefer.lower() not in buf.value.lower() if prefer else False, hwnd))
         return True
 
     user32.EnumWindows(cb, 0)
-    return found[0] if found else 0
+    # Stable sort: otherwise the topmost window, as before.
+    return sorted(found, key=lambda f: f[0])[0][1] if found else 0
 
 
 def _pids(exe: str) -> set[int]:
@@ -101,6 +104,15 @@ def _connect_with_approval(browser: str, url: str):
     """Open the websocket; if the browser holds it for user approval, surface
     the browser window so the prompt is visible, then put focus back."""
     result: dict = {}
+    if not _browser_window(browser):
+        # Running windowless (Edge's startup boost, or every window closed):
+        # with nowhere to show the approval prompt, the browser refuses the
+        # connection outright (HTTP 403). Open a window for it first.
+        subprocess.Popen(["cmd", "/c", "start", "", BROWSER_EXES[browser].removesuffix(".exe")],
+                         creationflags=subprocess.CREATE_NO_WINDOW)
+        deadline = time.time() + 10
+        while not _browser_window(browser) and time.time() < deadline:
+            time.sleep(0.3)
 
     def run():
         try:
@@ -116,7 +128,8 @@ def _connect_with_approval(browser: str, url: str):
         # raise itself, so a backgrounded browser just hangs the handshake.
         user32 = ctypes.windll.user32
         prev = user32.GetForegroundWindow()
-        hwnd = _browser_window(browser)
+        time.sleep(0.5)  # give the prompt window a moment to exist
+        hwnd = _browser_window(browser, prefer="remote debugging")
         if hwnd:
             _set_foreground(hwnd)
         t.join(APPROVAL_TIMEOUT)

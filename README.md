@@ -8,15 +8,16 @@ The thesis is simple: the Windows accessibility tree already contains a machine-
 
 ## How it works
 
-ahk-mcp exposes 27 tools over MCP's stdio transport:
+ahk-mcp exposes 29 tools over MCP's stdio transport:
 
 - **Observation tools** read the accessibility tree, window text, and UI element properties
 - **Action tools** send keystrokes, click coordinates, manage clipboard, launch programs
 - **Background action tools** act on windows *without* taking focus or moving the cursor (see [Background input](#background-input))
 - **Browser tools** drive Edge/Chrome through the DevTools Protocol, fully in the background
+- **Flow tools** wait for things and run several steps in one call (see [Fewer round trips](#fewer-round-trips))
 - **`ahk_eval`** is the escape hatch — execute arbitrary AHK v2 code for anything the built-in tools don't cover
 
-Every action tool reports context before and after execution (which window was focused, what changed). This "guardrails pattern" means the agent always knows what it just did and what state the system is in, without needing a follow-up screenshot.
+Every action tool ends with a `Changed:` line saying what the action did to the desktop: windows opened, closed or retitled, menus that popped up, what came to the front and what has focus there. For example, `Changed: opened "Save As"; front "Save As", focus Edit "File name:"`. This "guardrails pattern" means the agent always knows what it just did and what state the system is in, without needing a follow-up look. Windows belonging to the agent's own terminal are left out (Claude Code animates its title).
 
 ## Token cost comparison
 
@@ -100,7 +101,7 @@ After adding the config, restart Claude Code. The tools will appear with the `mc
 | `ahk_window_info` | Detailed info on a window (`target=`, default active): title, class, PID, process, position, and its Win32 controls (ClassNN names) with their text. |
 | `ahk_read` | Read all text content from a window (active or by title). Cheap and fast. |
 | `ahk_uia_tree` | Dump the UI Automation accessibility tree. In browsers it shows the active tab's page; unnamed layout wrappers are collapsed so depth goes to real content. |
-| `ahk_uia_find` | Search for UI elements by name and/or control type at any depth. Numbered matches with position and value. Token matching (all words, any order); polls briefly for pages still rendering. |
+| `ahk_uia_find` | Search for UI elements by name and/or control type at any depth. Matches carry position, value and a session ref (`e12`). Token matching (all words, any order); polls briefly for pages still rendering. |
 | `ahk_uia_url` | Get the current URL from the active browser's address bar (Firefox, Chrome, Edge). |
 | `ahk_screenshot` | Capture a screenshot of a window, region, or full screen. Returns a PNG file path. Uses PrintWindow for per-window capture (works even when the window is occluded). The fallback when you genuinely need pixels. |
 
@@ -112,8 +113,8 @@ These use the real keyboard/cursor and need the target in front. Pass `target=` 
 |---|---|
 | `ahk_focus` | Activate/focus a window by title. |
 | `ahk_send` | Send keystrokes using AHK syntax: `{Enter}`, `^c` (Ctrl+C), `!{F4}` (Alt+F4), `+{Home}` (Shift+Home), etc. |
-| `ahk_type` | Type plain text via SendText (no special key interpretation). |
-| `ahk_click` | Click at screen coordinates. Reports which window was active before and after. |
+| `ahk_type` | Type plain text (no special key interpretation). Text over 80 chars is pasted, with the clipboard saved and restored; shorter text is typed key by key (see [Typing](#typing)). `mode=keys\|paste` forces one. |
+| `ahk_click` | Click at coordinates, or on the centre of an element by `ref=e12`. Reports which window was active before and after. |
 | `ahk_clipboard` | Get or set the system clipboard. |
 | `ahk_run` | Launch a program, open a file, or navigate to a URL. |
 | `ahk_msgbox` | Show a message box to the user (notifications, confirmations). |
@@ -122,8 +123,8 @@ These use the real keyboard/cursor and need the target in front. Pass `target=` 
 
 | Tool | Description |
 |---|---|
-| `ahk_uia_invoke` | Find an element and act through UI Automation (Invoke / Toggle / Select / Expand / default action). No coordinates; works occluded and scrolled out of view. Focus guarded. |
-| `ahk_uia_set_value` | Set an input's text through UI Automation. Fires real input/change events. Focus guarded. |
+| `ahk_uia_invoke` | Act on an element (by `ref=` or by search) through UI Automation: Invoke / Toggle / Select / Expand / default action. No coordinates; works occluded and scrolled out of view. Focus guarded. |
+| `ahk_uia_set_value` | Set an input's text (by `ref=` or by search) through UI Automation. Fires real input/change events. Focus guarded. |
 | `ahk_control_send` | Text/keys to a background window via posted messages (AHK ControlSend). Classic Win32 only. |
 | `ahk_control_click` | Click a control or client point via posted messages (AHK ControlClick NA). Classic Win32 only. |
 
@@ -140,11 +141,38 @@ These use the real keyboard/cursor and need the target in front. Pass `target=` 
 | `ahk_browser_navigate` | Load a URL in a tab or a new background tab; waits for load. |
 | `ahk_browser_eval` | Evaluate JavaScript in a tab and return the result. |
 
+### Flow
+
+| Tool | Description |
+|---|---|
+| `ahk_wait` | Wait until a window, UI element or Chromium page element appears (or with `gone=true`, disappears), or a Chromium page has loaded with a given URL/title. Returns as soon as it holds, with the element's ref. |
+| `ahk_batch` | Run a list of steps (any tool, plus `sleep`) in one call. Stops at the first failure; one `Changed:` line at the end. |
+
 ### Escape hatch
 
 | Tool | Description |
 |---|---|
-| `ahk_eval` | Execute arbitrary AHK v2 code. Output via `FileAppend "text", "*"`, end with `ExitApp`. Full AHK v2 language: COM automation, DllCall, regex, file I/O, window manipulation — anything. |
+| `ahk_eval` | Execute arbitrary AHK v2 code. Output via `FileAppend "text", "*"`, end with `ExitApp`. Full AHK v2 language: COM automation, DllCall, regex, file I/O, window manipulation — anything. Script errors come back as text (`[AHK Error] ... (line N)`), never as a dialog on the user's screen. |
+
+## Fewer round trips
+
+Every tool call is a model turn, and for voice control each turn is seconds of silence. Three things cut the count:
+
+- **`ahk_batch`** runs a whole sequence in one call. Opening Notepad and typing into it is one call, not three:
+  ```json
+  {"steps": [
+    {"tool": "run", "target": "notepad.exe"},
+    {"tool": "wait", "until": "window", "target": "Notepad"},
+    {"tool": "type", "target": "Notepad", "text": "hello"}
+  ]}
+  ```
+  Step tools take the same arguments as the tools themselves; the `ahk_` prefix is optional.
+- **`ahk_wait`** replaces guessed sleeps and repeated looks. It returns the moment the condition holds.
+- **Refs.** `ahk_uia_find`, `ahk_uia_tree` (interactive elements) and `ahk_wait` label elements `e1`, `e2`, ... for the whole session, and the same element keeps its ref across searches. `ahk_uia_invoke`, `ahk_uia_set_value` and `ahk_click` take `ref=`, so acting on something already found needs no second search. A ref works for as long as the app keeps the element; once the app discards it, using the ref says it's stale. Browser tools have their own refs (`#123`).
+
+## Typing
+
+At full speed, some apps garble synthetic input. Win11 Notepad, given AHK's default `SendText`, keeps the first word and then repeats a single character for the rest; it also loses Shift states (`100%` arrives as `1005`). So keys are sent one at a time (AHK Event mode, minimal delay). That's reliable, but limited by the system timer to about 60 characters per second, so `ahk_type` pastes anything over 80 characters instead, saving the clipboard first and restoring it afterwards. Pass `mode=keys` where Ctrl+V means something else (terminals), or `mode=paste` to always paste. With clipboard history (Win+V) turned on, pasted text appears in it.
 
 ## Background input
 
